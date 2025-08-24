@@ -1,6 +1,8 @@
 # NTPsecDispatcher
 a launcher/service launcher for sycnchronising windows or linux with a secure NTP server.
 
+<img src="images/hero_image.svg" alt="NTPsecure Hero" width="800">
+
 <div class="flex-1">
     <a href="/CosmicIndustries/NTPsecDispatcher/releases/latest">
         <span>Latest</span>

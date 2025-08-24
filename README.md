@@ -1,9 +1,11 @@
 # NTPsecDispatcher
 a launcher/service launcher for sycnchronising windows or linux with a secure NTP server.
 
-Got it — we can enhance your `README.md` with **inline styling** using GitHub-flavored Markdown for better readability and emphasis. Here’s a styled version of your README:
-
-https://github.com/CosmicIndustries/NTPsecDispatcher/releases/tag/v.01
+<div class="flex-1">
+    <a href="/CosmicIndustries/NTPsecDispatcher/releases/latest">
+        <span>Latest</span>
+    </a>
+</div>
 
 ---
 

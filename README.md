@@ -9,6 +9,9 @@ a launcher/service launcher for sycnchronising windows or linux with a secure NT
     </a>
 </div>
 
+
+Docs
+https://github.com/CosmicIndustries/NTPsecDispatcher/blob/main/Docs/Fuscus.md
 ---
 
 # 🕒 TimeSync Agent

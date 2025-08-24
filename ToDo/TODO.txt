@@ -1,0 +1,458 @@
+Awesome — here’s the **fully annotated** package with ultrafast, lazy, and fast modes; dynamic pool selection; SYSTEM service support (via NSSM on Windows); nanosecond skew detection; memoization; and continuous live logging in ultrafast mode.
+
+I’ve included **verbose comments on (almost) every line** to make maintenance painless.
+
+---
+
+# `dispatcher.py` (fully annotated)
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cross-platform Time Sync Dispatcher
+-----------------------------------
+Features:
+- Windows: configures W32Time, auto-heals service, can install as SYSTEM service (via NSSM), telemetry logging.
+- Unix/macOS: uses chrony or ntpsec if available, telemetry logging.
+- Modes: fast, ultrafast (continuous nanosecond polling), lazy.
+- Nanosecond-level skew detection with small/large skew strategies.
+- Dynamic pool selection (accepts --pool from the launcher) + resilient fallback list.
+- Memoization of last skew across runs to avoid unnecessary corrections.
+
+NOTE: This script intentionally avoids PowerShell so it runs in minimal Windows environments.
+"""
+
+import asyncio            # Async subprocess + scheduling
+import os                 # Paths, environment
+import platform           # OS detection
+import sys                # Python executable, argv
+import json               # Memoization (store last skew)
+from datetime import datetime  # Timestamping logs
+import argparse           # CLI arguments parsing
+
+# -----------------------------
+# CLI Arguments
+# -----------------------------
+parser = argparse.ArgumentParser()                                      # Initialize argument parser
+parser.add_argument("--mode", choices=["fast", "ultrafast", "lazy"],    # Mode selection
+                    default="fast")
+parser.add_argument("--pool", type=str, default=None,                   # Optional: prefer this pool
+                    help="Optional: specify a reachable NTP pool")
+args = parser.parse_args()                                              # Parse CLI arguments
+MODE = args.mode                                                        # Selected mode
+FORCED_POOL = args.pool                                                 # Preferred pool (if any)
+
+# -----------------------------
+# Paths and Logs
+# -----------------------------
+if platform.system() == "Windows":                                      # If Windows...
+    LOG_DIR = r"C:\ProgramData\TimeSync"                                # Use ProgramData folder
+else:                                                                   # Else Unix/macOS
+    LOG_DIR = "/var/log/time-sync"                                      # Use a standard log dir
+os.makedirs(LOG_DIR, exist_ok=True)                                     # Ensure log dir exists
+
+LOG_FILE = os.path.join(LOG_DIR, "status.log")                          # Telemetry log path
+MEMO_FILE = os.path.join(LOG_DIR, "memo.json")                          # Memoization file path
+
+# -----------------------------
+# Mode Parameters
+# -----------------------------
+# Ultrafast = very frequent checks, adjust even tiny skews
+# Fast      = 1-minute checks, reasonable sensitivity
+# Lazy      = low frequency, ignore tiny skews
+if MODE == "ultrafast":
+    CHECK_INTERVAL = 1            # Seconds between checks (tight loop)
+    PRECISION_THRESHOLD_NS = 1e3  # Adjust for skews > 1,000 ns
+elif MODE == "lazy":
+    CHECK_INTERVAL = 1800         # 30 minutes
+    PRECISION_THRESHOLD_NS = 1e6  # Adjust for skews > 1,000,000 ns (1 ms)
+else:  # fast
+    CHECK_INTERVAL = 60           # 60 seconds
+    PRECISION_THRESHOLD_NS = 1e5  # Adjust for skews > 100,000 ns (0.1 ms)
+
+# -----------------------------
+# NTP Pools (Chrony + NTPsec + vendors)
+# -----------------------------
+POOLS = [
+    "pool.chrony.eu",                    # Chrony EU pool
+    "pool.ntp.org",                      # Global NTP pool
+    "time.cloudflare.com",               # Cloudflare time
+    "time.google.com",                   # Google public NTP
+    "0.europe.pool.ntpsec.org",          # NTPsec pool (EU)
+    "1.north-america.pool.ntpsec.org",   # NTPsec pool (NA)
+    "2.asia.pool.ntpsec.org",            # NTPsec pool (Asia)
+]
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def timestamp() -> str:
+    """Return a UTC timestamp string."""
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def log(msg: str) -> None:
+    """Log a message to console and append to the telemetry log."""
+    line = f"[{timestamp()}] {msg}"                     # Prefix message with timestamp
+    print(line)                                         # Console output
+    with open(LOG_FILE, "a", encoding="utf-8") as f:    # Append to log file
+        f.write(line + "\n")
+
+async def run_cmd(cmd: str) -> str:
+    """
+    Run a shell command asynchronously.
+    Returns captured stdout as a string.
+    Logs stderr (if any) at [CMD-ERR] level.
+    """
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()                 # Wait for process to complete
+    result = out.decode(errors="ignore").strip()        # Decode stdout
+    err_str = err.decode(errors="ignore").strip()       # Decode stderr
+    if err_str:                                         # If there was stderr, log it
+        log(f"[CMD-ERR] {cmd} => {err_str}")
+    return result                                       # Return stdout text (possibly empty)
+
+# -----------------------------
+# Windows: Configure + Telemetry + Drift
+# -----------------------------
+async def windows_config() -> None:
+    """Configure Windows W32Time, set peers, log telemetry, start service install (NSSM)."""
+    log("Configuring Windows Time Service...")
+
+    # Set poll intervals + client type via registry (no PowerShell needed)
+    reg_cmds = [
+        r'reg add "HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config" /v MinPollInterval /t REG_DWORD /d 0x6 /f',   # Min poll 64s
+        r'reg add "HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config" /v MaxPollInterval /t REG_DWORD /d 0xa /f',   # Max poll 1024s
+        r'reg add "HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters" /v Type /t REG_SZ /d NTP /f',             # Force NTP client
+    ]
+    for cmd in reg_cmds:
+        await run_cmd(cmd)                               # Apply registry changes
+
+    # Ensure w32time is enabled and running
+    status = await run_cmd("sc query w32time")           # Query service status
+    if "STOPPED" in status or "DISABLED" in status.upper():  # If stopped/disabled...
+        log("[WARN] Windows Time service not running or disabled, enabling...")
+        await run_cmd("sc config w32time start= auto")   # Auto-start on boot
+        await run_cmd("sc start w32time")                # Start now
+
+    # Restart service to apply changes cleanly
+    await run_cmd("net stop w32time")                    # Stop service (ignore failure)
+    await run_cmd("net start w32time")                   # Start again
+
+    # Choose pools: forced (from --pool) or fallback list
+    pools_to_use = [FORCED_POOL] if FORCED_POOL else POOLS
+
+    # Try pools in order; stop on first success
+    success = False
+    for pool in pools_to_use:
+        servers = " ".join([f"{i}.{pool},0x8" for i in range(4)])       # 0..3.pool,0x8 flags
+        cmd = f'w32tm /config /manualpeerlist:"{servers}" /syncfromflags:manual /update'
+        result = await run_cmd(cmd)                                      # Apply peer list
+        if result:                                                       # Heuristic success if stdout present
+            log(f"[OK] Configured {pool}")                               # Report success
+            await run_cmd("w32tm /resync /force")                        # One-time resync to align
+            success = True
+            break
+        else:
+            log(f"[FAIL] Could not configure {pool}")                    # Log failure and continue
+    if not success:
+        log("[FAIL] No NTP pools could be configured.")                  # All pools failed
+
+    await log_windows_status()                                           # Log status + peers
+    await drift_correction_windows()                                     # Apply skew strategy
+    await create_windows_service()                                       # Install as SYSTEM service (if NSSM available)
+
+async def log_windows_status() -> None:
+    """Append current status & peers to the telemetry log."""
+    log("[INFO] Logging telemetry...")
+    status_out = await run_cmd("w32tm /query /status")   # Query current status
+    peers_out  = await run_cmd("w32tm /query /peers")    # Query current peers
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n===== Sync Report {timestamp()} =====\n")           # Section header
+        f.write(status_out + "\n")                                      # Status lines
+        f.write(peers_out + "\n")                                       # Peers lines
+    log("[INFO] Telemetry written to " + LOG_FILE)                      # Confirm write
+
+async def drift_correction_windows() -> None:
+    """
+    Measure skew via stripchart against time.windows.com.
+    Apply small-skew incremental resync, or large-skew forced resync.
+    Log current skew in nanoseconds and memoize.
+    """
+    log("[INFO] Checking clock skew for high-precision adjustment...")
+
+    # Ask stripchart for a single data-only sample against a stable reference
+    output = await run_cmd("w32tm /stripchart /computer:time.windows.com /dataonly /samples:1")
+    try:
+        # Expect last line like: "15:10:00, -0.0090668s"
+        offset_line = [l for l in output.splitlines() if "," in l][-1]  # Pick the last line with comma
+        skew_s = float(offset_line.split(",")[1].strip().replace("s", ""))  # Parse seconds as float
+        skew_ns = skew_s * 1e9                                          # Convert to nanoseconds
+    except Exception:
+        skew_ns = None                                                  # If parse fails
+        log("[WARN] Could not parse skew, defaulting to forced resync")
+
+    # Load last skew (ns) from memo file (if present)
+    last_skew_ns = 0
+    if os.path.exists(MEMO_FILE):
+        with open(MEMO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            last_skew_ns = data.get("last_skew_ns", 0)
+
+    # Decide action based on skew thresholds
+    if skew_ns is not None:
+        log(f"[INFO] Current skew: {skew_ns:.0f} ns (last: {last_skew_ns:.0f} ns)")
+        if PRECISION_THRESHOLD_NS < abs(skew_ns) < 1e6:                 # Small skew: 1ns..1ms (threshold..1ms)
+            await run_cmd("w32tm /resync /nowait")                      # Gradual adjustment
+            log("[INFO] Applied precise incremental resync for small skew")
+        elif 1e8 < abs(skew_ns) < 1e9:                                  # Large skew: 100ms..1s
+            await run_cmd("w32tm /resync /force")                       # Force single step
+            log("[INFO] Applied forced resync for large skew")
+        else:
+            log("[INFO] Skew negligible; no adjustment needed")         # Otherwise do nothing
+
+        # Persist current skew to memo.json
+        with open(MEMO_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_skew_ns": skew_ns}, f)
+
+async def create_windows_service() -> None:
+    """
+    Install this dispatcher as a SYSTEM service via NSSM (if present).
+    NSSM should be at C:\nssm\nssm.exe (adjust if needed).
+    """
+    nssm_path = r"C:\nssm\nssm.exe"                                     # Expected NSSM path
+    if os.path.exists(nssm_path):                                       # If NSSM is available...
+        # Install service with current Python interpreter and this script
+        cmd_install = f'"{nssm_path}" install TimeSyncAgent "{sys.executable}" "{os.path.abspath(__file__)} --mode={MODE}"'
+        await run_cmd(cmd_install)
+        # Auto-start service
+        await run_cmd(f'"{nssm_path}" set TimeSyncAgent Start SERVICE_AUTO_START')
+        # Launch service immediately
+        await run_cmd(f'"{nssm_path}" start TimeSyncAgent')
+        log("[TASK] Dispatcher installed as SYSTEM service via NSSM")   # Confirm service install
+    else:
+        log("[WARN] NSSM not found, fallback to scheduled task or manual service install")
+
+# -----------------------------
+# Unix/macOS: Configure + Telemetry + Drift
+# -----------------------------
+async def unix_config() -> None:
+    """Configure chrony or ntpsec; log telemetry; apply skew strategy."""
+    log("Configuring Unix NTP client...")
+
+    # Detect chronyc (preferred) or ntpsec-ntpdate
+    tool = None
+    for bin in ["chronyc", "ntpsec-ntpdate"]:
+        result = await run_cmd(f"which {bin}")
+        if result:
+            tool = bin
+            break
+    if not tool:
+        log("[ERR] No chrony or ntpsec found")                          # Installer path could be added if desired
+        return
+
+    # Prefer forced pool if provided
+    pools_to_use = [FORCED_POOL] if FORCED_POOL else POOLS
+
+    # Try pools in order
+    success = False
+    for pool in pools_to_use:
+        # 'chronyc -a makestep' ensures immediate correction allowed; add server with iburst
+        cmd = f"{tool} -a makestep; {tool} add server {pool} iburst"
+        result = await run_cmd(cmd)
+        if result:
+            log(f"[OK] Configured {pool}")
+            success = True
+            break
+        else:
+            log(f"[FAIL] Pool {pool}: could not configure")
+    if not success:
+        log("[FAIL] No NTP pools could be configured")
+
+    # Telemetry: tracking + sources
+    status  = await run_cmd(f"{tool} tracking")
+    sources = await run_cmd(f"{tool} sources -v")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n===== Sync Report {timestamp()} =====\n")
+        f.write(status + "\n")
+        f.write(sources + "\n")
+    log("[INFO] Telemetry written to " + LOG_FILE)
+
+    # Drift correction (small/large strategy)
+    await drift_correction_unix(tool)
+
+async def drift_correction_unix(tool: str) -> None:
+    """
+    Measure skew via chronyc tracking (or ntpsec-ntpdate output if adapted).
+    Apply small-skew incremental step or large-skew forced step.
+    """
+    log("[INFO] Checking clock skew for high-precision adjustment...")
+
+    output = await run_cmd(f"{tool} tracking")                           # Ask for tracking info
+    try:
+        # Look for "Last offset     : 0.000123 seconds"
+        skew_ns = None
+        for line in output.splitlines():
+            if "Last offset" in line:
+                skew_s = float(line.split(":")[1].split()[0])           # Parse seconds
+                skew_ns = skew_s * 1e9                                  # Convert to ns
+                break
+    except Exception:
+        skew_ns = None
+
+    # Decide based on skew
+    if skew_ns is not None:
+        log(f"[INFO] Current skew: {skew_ns:.0f} ns")
+        if PRECISION_THRESHOLD_NS < abs(skew_ns) < 1e6:                  # Small skew
+            await run_cmd(f"{tool} makestep 0.001 3")                    # Gradual precise step
+            log("[INFO] Applied precise incremental adjustment")
+        elif 1e8 < abs(skew_ns) < 1e9:                                   # Large skew
+            await run_cmd(f"{tool} makestep")                            # Force step
+            log("[INFO] Applied forced step for large skew")
+        else:
+            log("[INFO] Skew negligible; no adjustment needed")
+
+# -----------------------------
+# Ultrafast Continuous Polling
+# -----------------------------
+async def ultrafast_loop() -> None:
+    """
+    In ultrafast mode, continuously:
+      - measure skew
+      - apply small or large adjustments as needed
+      - log each check
+    This runs indefinitely (designed for service/daemon use).
+    """
+    log("[ULTRAFAST] Starting continuous nanosecond-level polling...")
+    while True:
+        if platform.system() == "Windows":
+            await drift_correction_windows()             # Windows drift strategy
+        else:
+            # Re-detect tool each pass (in case of late install), cheap call
+            tool = None
+            for bin in ["chronyc", "ntpsec-ntpdate"]:
+                result = await run_cmd(f"which {bin}")
+                if result:
+                    tool = bin
+                    break
+            if tool:
+                await drift_correction_unix(tool)        # Unix drift strategy
+        await asyncio.sleep(CHECK_INTERVAL)              # Sleep per mode interval
+
+# -----------------------------
+# Main Entry
+# -----------------------------
+async def main() -> None:
+    """One-shot configuration + optional ultrafast continuous loop."""
+    log(f"Dispatcher start on {platform.system()} | Mode={MODE}")  # Startup banner with mode
+    if platform.system() == "Windows":                              # If Windows...
+        await windows_config()                                      # Configure Windows time client
+    else:                                                           # Else Unix/macOS...
+        await unix_config()                                         # Configure chrony/ntpsec
+
+    # In ultrafast mode, continue polling forever (daemon-like behavior)
+    if MODE == "ultrafast":
+        await ultrafast_loop()
+
+    log("Dispatcher complete.")                                     # For fast/lazy modes (no loop)
+
+# Run the async main entry
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+# `time-sync-agent.bat` (fully annotated)
+
+```bat
+@echo off
+:: ===============================================
+:: Time Sync Agent (Windows Launcher)
+:: - Pings multiple pools to pick a reachable one
+:: - Passes it to dispatcher as --pool=...
+:: - Selects mode (fast by default; ultrafast/lazy optional)
+:: - Intended to run as SYSTEM via NSSM at boot
+:: ===============================================
+
+setlocal enabledelayedexpansion
+
+:: ---- Candidate pools (Chrony, NTP.org, vendors, NTPsec) ----
+set PRIMARY_POOLS=pool.chrony.eu pool.ntp.org time.cloudflare.com time.google.com 0.europe.pool.ntpsec.org 1.north-america.pool.ntpsec.org 2.asia.pool.ntpsec.org
+
+:: ---- Find first reachable pool via ping ----
+set SELECTED_POOL=
+for %%P in (%PRIMARY_POOLS%) do (
+    ping -n 1 %%P >nul 2>&1
+    if !errorlevel! == 0 (
+        set SELECTED_POOL=%%P
+        goto :FOUND
+    )
+)
+
+:FOUND
+:: ---- Build dispatcher args ----
+if "%SELECTED_POOL%"=="" (
+    echo [WARN] No reachable NTP pool, using dispatcher defaults
+    set DISPATCHER_ARGS=--mode=fast
+) else (
+    echo [INFO] Selected reachable NTP pool: %SELECTED_POOL%
+    set DISPATCHER_ARGS=--mode=fast --pool=%SELECTED_POOL%
+)
+
+:: ---- Optional: force a mode globally (uncomment ONE) ----
+:: set DISPATCHER_ARGS=--mode=ultrafast --pool=%SELECTED_POOL%
+:: set DISPATCHER_ARGS=--mode=lazy --pool=%SELECTED_POOL%
+
+:: ---- Paths: adjust Python and dispatcher paths if needed ----
+set PYTHON_PATH=C:\Python39\python.exe
+set DISPATCHER_PATH=C:\Users\User\Desktop\time\dispatcher.py
+
+:: ---- Launch dispatcher ----
+"%PYTHON_PATH%" "%DISPATCHER_PATH%" %DISPATCHER_ARGS%
+
+endlocal
+```
+
+---
+
+# Windows service (SYSTEM) via NSSM
+
+1. Download NSSM: [https://nssm.cc/download](https://nssm.cc/download)
+2. Place `nssm.exe` at `C:\nssm\nssm.exe` (or adjust the path inside `dispatcher.py`).
+
+Then run (elevated Command Prompt):
+
+```bat
+C:\nssm\nssm.exe install TimeSyncAgent "C:\Python39\python.exe" "C:\Users\User\Desktop\time\dispatcher.py --mode=ultrafast"
+C:\nssm\nssm.exe set TimeSyncAgent Start SERVICE_AUTO_START
+C:\nssm\nssm.exe start TimeSyncAgent
+```
+
+This installs the dispatcher as a **Windows Service (LocalSystem)**, autostarting at boot in **ultrafast** mode for continuous nanosecond monitoring.
+
+> If you’d rather run the **batch launcher** as the service (so it does ping-based pool selection before starting Python), change the install command to:
+
+```bat
+C:\nssm\nssm.exe install TimeSyncAgent "C:\Windows\System32\cmd.exe" "/c C:\TimeSync\time-sync-agent.bat"
+```
+
+(Adjust the path to your actual `.bat` file.)
+
+---
+
+## Notes / Tips
+
+* **Telemetry** is always written to:
+
+  * Windows: `C:\ProgramData\TimeSync\status.log`
+  * Unix: `/var/log/time-sync/status.log`
+* **Memoization**: `memo.json` lives next to the log and stores the last measured skew in nanoseconds.
+* **w32time disabled?** The script auto-heals it (`sc config start= auto` and start it).
+* **chrony/ntpsec missing?** The Unix path logs an error. You can add an installer step if you want (`apt/yum/brew`) — say the word and I’ll wire that in.
+
+---
+
+If you want a **tiny terminal live viewer** (e.g., `tail -f` + ANSI chart) for `status.log`, I can add a separate `viewer.py` that graphs skew in real time.

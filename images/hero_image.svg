@@ -1,0 +1,8 @@
+<svg width="800" height="200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="800" height="200" fill="#0b0f1a"></rect>
+  <text x="50" y="80" font-family="Arial" font-size="48" fill="#00bfff">NTPsecure</text>
+  <text x="50" y="140" font-family="Arial" font-size="24" fill="#ffffff">Cross-platform high-precision NTP synchronization</text>
+  <circle cx="700" cy="90" r="50" stroke="#00bfff" stroke-width="5" fill="none"></circle>
+  <line x1="700" y1="90" x2="700" y2="60" stroke="#00bfff" stroke-width="3"></line>
+  <line x1="700" y1="90" x2="730" y2="90" stroke="#00bfff" stroke-width="3"></line>
+</svg>

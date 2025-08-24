@@ -1,0 +1,93 @@
+Got it ?? — instead of going heavy on a TUI, we can **optimize your dispatcher for performance** so `--mode=ultrafast` can poll at sub-second intervals without wasting cycles or blocking I/O.
+
+Here are **performance enhancement strategies** I’d propose for your agent:
+
+---
+
+## ?? Performance Enhancements
+
+### 1. Async & Parallelism
+
+* Keep all I/O (`w32tm`, `chronyc`, file writes) fully **async subprocesses**, no blocking calls.
+* Batch drift + telemetry checks so only one subprocess is open at a time.
+
+### 2. Memoization & Throttling
+
+* Skip adjustments if skew difference from the last run is below a **? threshold** (e.g., <100 ns difference from last offset).
+* Cache pool DNS resolutions for 1–5 minutes to avoid repeated lookups when DNS is slow.
+
+### 3. Smarter Logging
+
+* Buffer log writes in memory and flush every N checks (e.g., every 10 iterations or 5 s).
+* Only write deltas instead of full state when skew is negligible.
+
+### 4. Efficient Offset Extraction
+
+* On Windows: instead of parsing all of `w32tm /query /status`, call `w32tm /stripchart /computer:%POOL% /dataonly /samples:1` ? gives offset directly.
+* On Unix: prefer `chronyc tracking` with `-n` (numeric only) for faster parsing.
+
+### 5. Adaptive Interval
+
+* In `--mode=ultrafast`:
+
+  * If skew <1 µs consistently, slow down to 2–3 s checks automatically.
+  * If skew drifts >100 µs, increase frequency to 0.5 s until stable again.
+
+### 6. Persistent Worker
+
+* Instead of restarting per-check, maintain one subprocess (e.g., `chronyc` interactive or persistent `w32time` query loop) ? drastically reduces process creation overhead.
+
+---
+
+## ? Example Code Enhancements (dispatcher\_ultrafast.py)
+
+Here’s how we’d integrate these:
+
+```python
+OFFSET_THRESHOLD_NS = 100   # ignore changes smaller than 100 ns
+LOG_BUFFER = []
+LOG_FLUSH_INTERVAL = 10     # flush after 10 iterations
+DNS_CACHE = {}
+
+async def resolve_pool(host: str):
+    now = time.time()
+    if host in DNS_CACHE and now - DNS_CACHE[host]["ts"] < 300:
+        return DNS_CACHE[host]["ip"]
+    proc = await asyncio.create_subprocess_exec(
+        "nslookup", host,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    ip = out.decode().split()[-1]
+    DNS_CACHE[host] = {"ip": ip, "ts": now}
+    return ip
+
+async def log_skew(ns_offset: int):
+    global LOG_BUFFER
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    LOG_BUFFER.append(f"{ts} | offset={ns_offset} ns")
+    if len(LOG_BUFFER) >= LOG_FLUSH_INTERVAL:
+        with open(LOG_FILE, "a") as f:
+            f.write("\n".join(LOG_BUFFER) + "\n")
+        LOG_BUFFER = []
+
+async def drift_check_fast():
+    if platform.system() == "Windows":
+        cmd = ["w32tm", "/stripchart", f"/computer:{POOL}", "/dataonly", "/samples:1"]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+        out, _ = await proc.communicate()
+        if b"offset" in out:
+            ns_offset = parse_offset(out.decode())
+            if abs(ns_offset - last_skew()) > OFFSET_THRESHOLD_NS:
+                await drift_adjust(ns_offset)
+            await log_skew(ns_offset)
+```
+
+---
+
+This way, `--mode=ultrafast` runs **lighter**, reduces disk writes, avoids hammering DNS, and adapts its polling interval dynamically based on drift conditions.
+
+---
+
+?? Question: do you want me to **fully rewrite your dispatcher** with these performance tweaks baked in, or add them as a **separate ultrafast-optimized module** (`dispatcher_ultrafast.py`) so you can swap between standard and optimized modes?

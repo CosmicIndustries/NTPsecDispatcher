@@ -5,7 +5,7 @@ a launcher/service launcher for sycnchronising windows or linux with a secure NT
 
 <div class="flex-1">
     <a href="/CosmicIndustries/NTPsecDispatcher/releases/latest">
-        <span>        -Latest</span>
+        <span><nbsp><nbsp><nbsp><nbsp><nbsp><nbsp>-Latest</span>
     </a>
 </div>
 

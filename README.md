@@ -44,9 +44,10 @@ https://github.com/CosmicIndustries/NTPsecDispatcher/blob/main/Docs/Fuscus.md
 
 1. Install **Python 3.9+**
 2. Install **NSSM**: [https://nssm.cc/download](https://nssm.cc/download)
-3. Clone or download this repository
-4. Edit `time-sync-agent.bat` with your **Python path** and **dispatcher path**
-5. Run manually once to verify:
+   (Optional for service handling)
+4. Clone or download this repository
+5. Edit `time-sync-agent.bat` with your **Python path** and **dispatcher path**
+6. Run manually once to verify:
 
 ```bat
 time-sync-agent.bat

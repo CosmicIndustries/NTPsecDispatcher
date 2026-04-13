@@ -1,1 +1,67 @@
-FIX ME
+FIXES APPLIED (refactor pass)
+=============================
+
+dispatcher.py + dispatchService.py
+-----------------------------------
+- Merged both files into a single dispatcher.py (85% were duplicate)
+- dispatchService.py is now a 3-line backward-compat shim (runpy re-dispatch)
+- Moved argparse out of module scope — was breaking any import of dispatchService
+- unix_config(): rewrote to write actual /etc/chrony/chrony.conf (was using
+  ephemeral 'chronyc add server' which does not survive daemon restart)
+- unix_config(): fixed tool detection — was detecting chronyc then not using
+  the variable when calling drift_correction
+- drift_correction_unix(): removed hardcoded 'chronyc' — now routes to
+  whichever tool was detected (chrony, ntpq)
+- run_cmd(): added asyncio.wait_for timeout (15s default) — was hanging forever
+  on unresponsive pools
+- memo writes: made atomic via temp-file + os.replace to prevent corruption
+- Renamed loop variable 'bin' → 'candidate' (was shadowing Python builtin)
+- Added signal handling (SIGINT/SIGTERM) to ultrafast loop — was leaving
+  subprocess orphans on Ctrl-C
+- Added NTS conditional: only writes 'nts' directive to chrony.conf when
+  chrony >= 4.0 is detected
+- windows_configure(): moved telemetry call to after service restart (not before)
+- windows_install_service(): unified create_windows_task + create_windows_service
+  into one function with NSSM-present/absent branching
+- Added LARGE_SKEW_MAX_NS cap (1 s) — skews above 1 s were being acted on
+  as if they were drifts, when they may indicate a clock jump or RTC issue
+
+time-sync-agent.bat
+--------------------
+- Removed duplicate @echo off at line 1
+- Removed duplicate setlocal enabledelayedexpansion
+- Removed the entire second setlocal block — it was dead code (dispatcher was
+  already launched and process exited before reaching it)
+- Fixed DISPATCHER_ARGS: was never initialized in the no-pool branch, causing
+  a bare '--mode=fast' with a trailing undefined variable reference
+- Replaced hardcoded C:\Python39\python.exe with 'python' (resolved via PATH)
+- Replaced hardcoded C:\Users\User\Desktop\time\ with %~dp0 (script-relative)
+- Added admin check at top (was buried 200 lines into the dead code block)
+- Added dispatcher exit-code propagation
+
+time-sync-agent.sh
+-------------------
+- log(): removed '>/dev/null' that was suppressing ALL console output
+- Cache loading: replaced 'source "$CACHE_FILE"' (arbitrary code execution risk
+  if cache file is writable by others) with a safe IFS= read loop
+- NTS directive: now conditional on chrony version >= 4.0 detection
+- Atomic config writes via temp-file + mv (was direct overwrite)
+- cache file permissions: chmod 600 on save
+
+driftMonitor.py + driftMonitorDual.py
+--------------------------------------
+- Merged into a single driftMonitor.py (dual was strictly better; basic removed)
+- Refactored to import shared measurement/correction functions from dispatcher.py
+  instead of reimplementing them
+- Improved graph rendering: labeled axes, human-readable ns/µs/ms/s values,
+  directional indicators (◀/▶)
+- Added signal handling for clean exit
+
+SECURITY.md
+-----------
+- Replaced default GitHub template text (version table referenced 5.1.x/4.0.x
+  which have nothing to do with this project) with accurate policy
+
+FIX_ME
+------
+- You're reading it.

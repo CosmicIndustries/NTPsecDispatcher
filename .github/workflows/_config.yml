@@ -1,0 +1,21 @@
+title: NTPsecDispatcher
+description: Cross-platform, high-precision NTP synchronization agent with auto-fallback and nanosecond telemetry.
+theme: jekyll-theme-cayman
+
+plugins:
+  - jekyll-relative-links
+
+relative_links:
+  enabled: true
+  collections: true
+
+include:
+  - Docs
+
+exclude:
+  - .venv/
+  - venv/
+  - "*.py"
+  - "*.sh"
+  - "*.bat"
+  - ToDo/
